@@ -876,7 +876,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
-<<<<<<< HEAD
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
