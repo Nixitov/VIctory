@@ -93,23 +93,6 @@ const DYNAMIC: u32 = 1 << 18;
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The slots of a view heap capped at `limit` (the host's actual limit for
-/// shader-visible heaps): the dynamic range gets [`DYNAMIC`] where the host
-/// takes it (rounded down to a power of two, and never below [`MIN_DYNAMIC`]
-/// while it fits), and the title's slots get what it leaves, up to the
-/// title's count. Returns (title slots, dynamic slots); the heap is these
-/// plus the guard slot. #747: 65,536 dynamic slots ran out in the world and
-/// left the G-buffer black (0.1% coverage; 60-65% with 2^18).
-fn capped(count: u32, guard: u32, limit: u32) -> (u32, u32) {
-    let room = limit.saturating_sub(guard);
-    let mut dynamic = DYNAMIC.min(room);
-    if dynamic > MIN_DYNAMIC {
-        dynamic = 1 << (u32::BITS - 1 - dynamic.leading_zeros());
-    }
-    let dynamic = dynamic.max(MIN_DYNAMIC.min(room));
-    let count = count.min(room.saturating_sub(dynamic));
-    (count, dynamic)
-}
-
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -155,28 +138,34 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views) + guard) {
             (heap, count, DYNAMIC + guard)
-        } else {
-            // The host's heaps are smaller than `HEAP_VIEWS`: take the
-            // portable cap, with the dynamic range #747 needs (2^16 ran out
-            // of slots and left the world black) and the title's slots the
-            // rest. The heap's spare slots past the dynamic ones hold the
-            // copies' view pairs (`crate::memory`).
-            let (fits, dynamic) = capped(count, guard, PORTABLE_VIEWS);
+        } else if count + MIN_DYNAMIC + guard > PORTABLE_VIEWS {
+            // The title's slots do not fit with even the smallest dynamic
+            // range: take the portable cap, keep the title's slots below the
+            // dynamic ones. The title's heap indices reach past what the host
+            // holds either way; taking their room for a larger dynamic range
+            // left the world reading nulls (all slots past 737,855), so the
+            // dynamic range stays at its floor here.
             match make(PORTABLE_VIEWS) {
-                Ok(heap) => (heap, fits, dynamic + guard),
+                Ok(heap) => (
+                    heap,
+                    PORTABLE_VIEWS - MIN_DYNAMIC - guard,
+                    MIN_DYNAMIC + guard,
+                ),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         count,
                         "host view heap capped below {PORTABLE_VIEWS}"
                     );
-                    match make(count + MIN_DYNAMIC + guard) {
-                        Ok(heap) => (heap, count, MIN_DYNAMIC + guard),
-                        Err(e) => {
-                            tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                            return None;
-                        }
-                    }
+                    return None;
+                }
+            }
+        } else {
+            match make(count + MIN_DYNAMIC + guard) {
+                Ok(heap) => (heap, count, MIN_DYNAMIC + guard),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
                 }
             }
         };
@@ -1658,23 +1647,6 @@ mod tests {
         assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
         // Multisampled UAVs need a cap; they stay 2D.
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
-    }
-
-    /// A host that caps its view heaps gives the dynamic range the room it
-    /// needs (#747), and a small host what fits.
-    #[test]
-    fn capped_heaps_keep_the_dynamic_range() {
-        // The world's ~1,245,184-slot title heap on a 1,000,000-slot host
-        // (the RTX 5070): 2^18 dynamic slots, the rest title slots.
-        let (count, dynamic) = capped(1_245_184, 1, 1_000_000);
-        assert!(dynamic >= DYNAMIC, "{dynamic} dynamic slots");
-        assert_eq!(count + dynamic + 1, 1_000_000);
-        assert!(count > 0, "title slots kept");
-        // A small host: the dynamic range floors at MIN_DYNAMIC where it
-        // fits, and the heap never passes the limit.
-        let (count, dynamic) = capped(1_245_184, 1, 100_000);
-        assert_eq!(dynamic, MIN_DYNAMIC);
-        assert_eq!(count + dynamic + 1, 100_000);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.

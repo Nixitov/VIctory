@@ -2234,6 +2234,14 @@ impl Batch<'_> {
             }
         }
         self.refreshes = kept;
+        // `pending` indexes `refreshes`: both are rebuilt together, or a copy
+        // kept here still points at the index its entry had before the split.
+        self.pending.clear();
+        for (i, (shadow, _, _)) in self.refreshes.iter().enumerate() {
+            self.pending
+                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .or_insert(i);
+        }
         for (shadow, from, to) in due {
             self.update(&shadow, from, to);
         }
