@@ -37,8 +37,16 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Of a title copy: waiting for earlier submissions, flushing pending
+    /// refreshes, checking the destination is mapped, opening its guards,
+    /// and the reads that met an unmapped page.
+    CopySettle,
+    CopyFlush,
+    CopyCommitted,
+    CopyGuard,
+    CopyFallback,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 27;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +134,16 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "of a title copy: {:.1} ms waiting for earlier submissions, {:.1} ms flushing refreshes, \
+         {:.1} ms checking the destination, {:.1} ms opening its guards, {:.1} ms reading around \
+         unmapped pages",
+        ms(c[C::CopySettle as usize]),
+        ms(c[C::CopyFlush as usize]),
+        ms(c[C::CopyCommitted as usize]),
+        ms(c[C::CopyGuard as usize]),
+        ms(c[C::CopyFallback as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
