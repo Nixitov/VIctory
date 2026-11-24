@@ -1342,8 +1342,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
+            let dims = match kind {
+                DISPATCH => dispatch_dims(arguments, stride),
+                _ => String::new(),
+            };
             self.op_text(
-                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                format!("indirect kind {kind} max {max} {dims}at {arguments:#x}"),
                 kind == DISPATCH,
             )
         });
@@ -1371,6 +1375,24 @@ impl State {
         }
         true
     }
+}
+
+/// A dispatch's group counts from the indirect arguments at title address
+/// `at`, for the note ("dispatch 480x270x1"), or nothing if their memory is
+/// not readable (`VICTORY_GPU_TIMING`).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dispatch_dims(at: u64, stride: u32) -> String {
+    if stride != 12 {
+        return String::new();
+    }
+    let mut bytes = [0u8; 12];
+    if !crate::host::read_into(at as *const u8, &mut bytes) {
+        return String::new();
+    }
+    let dword = |i: usize| {
+        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+    };
+    format!("dispatch {}x{}x{} ", dword(0), dword(4), dword(8))
 }
 
 /// The host command signature for one argument of `kind` with records
