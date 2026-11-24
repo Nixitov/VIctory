@@ -1651,7 +1651,7 @@ impl HostList {
                     add(C::CopySettle, settling.elapsed().as_micros() as u64);
                     #[cfg(feature = "diagnostics")]
                     let flushing = std::time::Instant::now();
-                    batch.title_written();
+                    batch.title_written(dst, len);
                     #[cfg(feature = "diagnostics")]
                     add(C::CopyFlush, flushing.elapsed().as_micros() as u64);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -1685,7 +1685,7 @@ impl HostList {
                         Step::Run(_, (to, written), (from, read)) => {
                             batch.settle(from, read, false);
                             batch.settle(to, written, true);
-                            batch.title_written();
+                            batch.title_written(to, written);
                         }
                         Step::Host(_, (from, read)) => batch.settle(from, read, false),
                         _ => {}
@@ -1703,7 +1703,7 @@ impl HostList {
                     // an earlier submission's shaders may still be writing;
                     // the shaders start from the title's data.
                     batch.settle(*address, *len, false);
-                    batch.flush();
+                    batch.flush_at(*address, *len);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -1789,22 +1789,58 @@ impl Batch<'_> {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
-        self.flush();
+    /// Before a step that writes title memory `[at, at + len)`: the pending
+    /// refreshes of that range are done first, and textures are checked
+    /// again after it. Refreshes of other ranges stay pending — the step
+    /// cannot have changed them, and flushing them here made the world's
+    /// 174 MB heap scanned again for every one of its thousands of small
+    /// title copies per frame.
+    fn title_written(&mut self, at: usize, len: usize) {
+        self.flush_at(at, len);
         self.textures.clear();
     }
 
-    fn flush(&mut self) {
+    /// Brings the pending refreshes of `[at, at + len)` up to date now, and
+    /// leaves the rest pending (split at the range's ends).
+    fn flush_at(&mut self, at: usize, len: usize) {
+        let end = at.saturating_add(len);
+        let mut due = Vec::new();
+        let mut kept = Vec::new();
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            if from < end && at < to {
+                let (first, last) = (from.max(at), to.min(end));
+                due.push((shadow.clone(), first, last));
+                if from < first {
+                    kept.push((shadow.clone(), from, first));
+                }
+                if last < to {
+                    kept.push((shadow, last, to));
+                }
+            } else {
+                kept.push((shadow, from, to));
+            }
+        }
+        self.refreshes = kept;
+        for (shadow, from, to) in due {
+            self.update(&shadow, from, to);
+        }
+    }
+
+    /// Brings `[from, to)` of `shadow`'s host copy up to date now.
+    fn update(&self, shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
+    fn flush(&mut self) {
+        let pending: Vec<_> = self.refreshes.drain(..).collect();
+        for (shadow, from, to) in pending {
+            self.update(&shadow, from, to);
         }
     }
 }
@@ -2646,7 +2682,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        batch.title_written(0, 64);
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.
