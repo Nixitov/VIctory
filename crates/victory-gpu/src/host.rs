@@ -1444,18 +1444,36 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        // Titles upload in many small adjacent copies (constant buffers and
+        // command blocks written in pieces): one step for the run, so one
+        // kernel copy and one guard check for it instead of one each.
+        if let Some(Step::Copy(last_dst, last_src, last_len)) = deferred.copies.last_mut()
+            && (*last_dst).wrapping_add(*last_len) == dst as usize
+            && (*last_src).wrapping_add(*last_len) == src as usize
+        {
+            *last_len += len;
+        } else {
+            deferred
+                .copies
+                .push(Step::Copy(dst as usize, src as usize, len));
+        }
         deferred.refreshed.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let mut deferred = self.deferred();
+        if let Some(Step::Fill(last_dst, last_src, last_len)) = deferred.copies.last_mut()
+            && (*last_dst).wrapping_add(*last_len) == dst as usize
+            && (*last_src).wrapping_add(*last_len) == src as usize
+        {
+            *last_len += len;
+        } else {
+            deferred
+                .copies
+                .push(Step::Fill(dst as usize, src as usize, len));
+        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
