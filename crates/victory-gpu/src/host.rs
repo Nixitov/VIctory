@@ -1885,10 +1885,17 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    // One kernel read, which reports an unmapped page at either end instead
-    // of faulting (a title destination with pages the title unmapped stops
-    // at the first of them, below).
-    let whole = read(src, dst, len);
+    // Both ways report an unmapped page instead of faulting: into host
+    // memory a user-mode copy of ours ([`crate::title_copy`]) that reports
+    // its own faults, into title memory the kernel (which also checks the
+    // destination, so a title destination with pages the title unmapped
+    // stops at the first of them, below).
+    let whole = if title_dst {
+        read(src, dst, len)
+    } else {
+        // SAFETY: the destination is host memory of `len` bytes.
+        unsafe { crate::title_copy::copy(dst, src, len) }
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -1911,7 +1918,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let falling = std::time::Instant::now();
-    copy_regions(src, dst, len);
+    copy_regions(src, dst, len, !title_dst);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::CopyFallback,
@@ -1924,7 +1931,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// A region whose read fails (a page the title unmapped inside it, say) is
 /// halved until the failing page is found, so a hole costs a handful of
 /// reads rather than one per page.
-fn copy_regions(src: *const u8, dst: *mut u8, len: usize) {
+fn copy_regions(src: *const u8, dst: *mut u8, len: usize, host_dst: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1945,7 +1952,7 @@ fn copy_regions(src: *const u8, dst: *mut u8, len: usize) {
                 .clamp(1, end - at)
         };
         if info.State == MEM_COMMIT {
-            copy_span(at, dst, start, span);
+            copy_span(at, dst, start, span, host_dst);
         } else {
             zero(at, dst, start, span);
         }
@@ -1954,12 +1961,18 @@ fn copy_regions(src: *const u8, dst: *mut u8, len: usize) {
 }
 
 /// Copies the title memory `[at, at + len)` into `dst` (whose first byte
-/// stands for `start`), halving it while the kernel read fails; zeros for
-/// pages that cannot be read.
-fn copy_span(at: usize, dst: *mut u8, start: usize, len: usize) {
+/// stands for `start`), halving it while the read fails; zeros for pages
+/// that cannot be read.
+fn copy_span(at: usize, dst: *mut u8, start: usize, len: usize, host_dst: bool) {
     // SAFETY: inside the destination, which the caller checked is mapped.
     let to = unsafe { dst.add(at - start) };
-    if read(at as *const u8, to, len) {
+    let whole = if host_dst {
+        // SAFETY: host memory of `len` bytes, as the caller vouches.
+        unsafe { crate::title_copy::copy(to, at as *const u8, len) }
+    } else {
+        read(at as *const u8, to, len)
+    };
+    if whole {
         return;
     }
     if len <= 4 << 10 {
@@ -1970,8 +1983,8 @@ fn copy_span(at: usize, dst: *mut u8, start: usize, len: usize) {
         return;
     }
     let half = (len / 2).next_multiple_of(4 << 10).min(len - (4 << 10));
-    copy_span(at, dst, start, half);
-    copy_span(at + half, dst, start, len - half);
+    copy_span(at, dst, start, half, host_dst);
+    copy_span(at + half, dst, start, len - half, host_dst);
 }
 
 /// Writes zeros over `[at, at + len)` of the destination `dst`.

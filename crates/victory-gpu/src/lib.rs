@@ -52,6 +52,8 @@ mod texture;
 #[cfg(windows)]
 mod timeline;
 #[cfg(windows)]
+mod title_copy;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
