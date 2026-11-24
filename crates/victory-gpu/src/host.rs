@@ -1609,9 +1609,17 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let settling = std::time::Instant::now();
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
+                    #[cfg(feature = "diagnostics")]
+                    add(C::CopySettle, settling.elapsed().as_micros() as u64);
+                    #[cfg(feature = "diagnostics")]
+                    let flushing = std::time::Instant::now();
                     batch.title_written();
+                    #[cfg(feature = "diagnostics")]
+                    add(C::CopyFlush, flushing.elapsed().as_micros() as u64);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1770,12 +1778,14 @@ impl Batch<'_> {
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// destination whose pages the title unmapped takes what the kernel copies
+/// up to the first one, and keeps the rest.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// The copy runs through the kernel (`ReadProcessMemory`), which reports an
+/// unmapped page instead of faulting; only a copy that failed looks at the
+/// page map. Asking `VirtualQuery` first cost about 2 ms per copy in the
+/// title's big pools (it walks the page tables to the region's end), which
+/// made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1787,15 +1797,25 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
         crate::watch::writing(dst as usize, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::CopyGuard,
+            guarding.elapsed().as_micros() as u64,
+        );
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
+    // One kernel read, which reports an unmapped page at either end instead
+    // of faulting (a title destination with pages the title unmapped stops
+    // at the first of them, below).
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -1804,22 +1824,90 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    #[cfg(feature = "diagnostics")]
+    let checking = std::time::Instant::now();
+    // A title destination with unmapped pages is left alone (the title
+    // unmapped them); the check runs only for a copy that failed.
+    let mapped = !title_dst || crate::texture::committed(dst, len);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::CopyCommitted,
+        checking.elapsed().as_micros() as u64,
+    );
+    if !mapped {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let falling = std::time::Instant::now();
+    copy_regions(src, dst, len);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::CopyFallback,
+        falling.elapsed().as_micros() as u64,
+    );
+}
+
+/// Copies `len` bytes from title memory at `src` into the mapped `dst`, a
+/// memory region at a time: mapped ones in one read, unmapped ones as zeros.
+/// A region whose read fails (a page the title unmapped inside it, say) is
+/// halved until the failing page is found, so a hole costs a handful of
+/// reads rather than one per page.
+fn copy_regions(src: *const u8, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let start = src as usize;
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let span = if n == 0 {
+            end - at
+        } else {
+            (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .saturating_sub(at)
+                .clamp(1, end - at)
+        };
+        if info.State == MEM_COMMIT {
+            copy_span(at, dst, start, span);
+        } else {
+            zero(at, dst, start, span);
         }
-    });
+        at += span;
+    }
+}
+
+/// Copies the title memory `[at, at + len)` into `dst` (whose first byte
+/// stands for `start`), halving it while the kernel read fails; zeros for
+/// pages that cannot be read.
+fn copy_span(at: usize, dst: *mut u8, start: usize, len: usize) {
+    // SAFETY: inside the destination, which the caller checked is mapped.
+    let to = unsafe { dst.add(at - start) };
+    if read(at as *const u8, to, len) {
+        return;
+    }
+    if len <= 4 << 10 {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unmapped, len as u64);
+        // SAFETY: inside the destination, as above.
+        unsafe { to.write_bytes(0, len) };
+        return;
+    }
+    let half = (len / 2).next_multiple_of(4 << 10).min(len - (4 << 10));
+    copy_span(at, dst, start, half);
+    copy_span(at + half, dst, start, len - half);
+}
+
+/// Writes zeros over `[at, at + len)` of the destination `dst`.
+fn zero(at: usize, dst: *mut u8, start: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Unmapped, len as u64);
+    // SAFETY: inside the destination, which the caller checked is mapped.
+    unsafe { dst.add(at - start).write_bytes(0, len) };
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1839,40 +1927,37 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
-/// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+/// Copies `len` bytes of mapped memory at `src` to title memory at `at`,
+/// unless a destination page is not writable.
+fn write(at: usize, src: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
-    if len == 0 || write(dst as usize, len) {
-        return;
+    let mut done = 0;
+    // SAFETY: the source is mapped memory of `len` bytes; the kernel checks
+    // the destination.
+    unsafe {
+        WriteProcessMemory(GetCurrentProcess(), at as _, src.cast(), len, &mut done) != 0
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
-    });
 }
 
-/// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
-/// `step`.
-fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
-    let end = start + len;
-    let mut at = start;
-    while at < end {
-        let next = ((at / step + 1) * step).min(end);
-        f(at, next - at);
-        at = next;
+/// Copies host memory into title memory after a submission (what shaders
+/// wrote), leaving pages that are not mapped alone. One write for the whole
+/// range; a range that fails is halved (see [`copy_span`]) so an unmapped
+/// page costs a handful of writes rather than one per page.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_span(dst as usize, src, dst as usize, len);
+}
+
+/// Writes the host copy `src` over the title memory `[at, at + len)`, where
+/// `src`'s first byte stands for `start`, halving while the write fails.
+fn write_span(at: usize, src: *const u8, start: usize, len: usize) {
+    let from = src.wrapping_add(at - start);
+    if write(at, from, len) || len <= 4 << 10 {
+        return;
     }
+    let half = (len / 2).next_multiple_of(4 << 10).min(len - (4 << 10));
+    write_span(at, src, start, half);
+    write_span(at + half, src, start, len - half);
 }
 
 impl Host {
@@ -2543,6 +2628,89 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod copies {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    };
+
+    const PAGE: usize = 4096;
+
+    /// Three pages, the middle one decommitted: the range has a hole.
+    fn pages_with_a_hole(fill: u8) -> *mut u8 {
+        // SAFETY: a fresh allocation of three pages, the middle one given
+        // back; the caller frees the rest.
+        unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                3 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as *mut u8;
+            assert!(!p.is_null());
+            p.write_bytes(fill, PAGE);
+            p.add(2 * PAGE).write_bytes(fill, PAGE);
+            assert_ne!(VirtualFree(p.add(PAGE).cast(), PAGE, MEM_DECOMMIT), 0);
+            p
+        }
+    }
+
+    fn free(p: *mut u8) {
+        // SAFETY: an allocation from `pages_with_a_hole`.
+        unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_hole_in_the_source_reads_as_zeros() {
+        let src = pages_with_a_hole(0x11);
+        let mut dst = vec![0xaa_u8; 3 * PAGE];
+        super::copy_mapped(dst.as_mut_ptr(), src, 3 * PAGE, false);
+        assert!(dst[..PAGE].iter().all(|&b| b == 0x11));
+        assert!(dst[PAGE..2 * PAGE].iter().all(|&b| b == 0));
+        assert!(dst[2 * PAGE..].iter().all(|&b| b == 0x11));
+        free(src);
+    }
+
+    #[test]
+    fn a_title_destination_with_a_hole_is_not_zero_filled() {
+        let src = vec![0x22_u8; 3 * PAGE];
+        let dst = pages_with_a_hole(0xaa);
+        // The kernel copies up to the hole, then reports it.
+        assert!(!super::read(src.as_ptr(), dst, 3 * PAGE));
+        super::copy_mapped(dst, src.as_ptr(), 3 * PAGE, true);
+        // The page past the hole keeps the title's bytes (a copy that
+        // treats that failure as an unmapped source would zero it).
+        // SAFETY: the pages still mapped.
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(dst.add(2 * PAGE), PAGE),
+                vec![0xaa; PAGE]
+            );
+        }
+        free(dst);
+    }
+
+    #[test]
+    fn a_title_copy_lands_in_title_memory() {
+        let src: Vec<u8> = (0..3 * PAGE).map(|i| i as u8).collect();
+        // SAFETY: a fresh allocation of three pages.
+        let dst = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as *mut u8
+        };
+        assert!(!dst.is_null());
+        super::copy_mapped(dst, src.as_ptr(), 3 * PAGE, true);
+        // SAFETY: our allocation, written above.
+        unsafe { assert_eq!(std::slice::from_raw_parts(dst, 3 * PAGE), src) };
+        free(dst);
     }
 }
 
