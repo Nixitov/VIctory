@@ -395,7 +395,6 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
 
     fn walk(
         p: &Program,
-        st: &Structured,
         def_site: &HashMap<Value, Site>,
         phi_at: &HashMap<Value, (usize, usize)>,
         v: Value,
@@ -409,7 +408,7 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
             seen.push(v);
             let mut found = None;
             for &arg in &p.blocks[b].phis[i].args {
-                if let Some(m) = walk(p, st, def_site, phi_at, arg, lane, seen)? {
+                if let Some(m) = walk(p, def_site, phi_at, arg, lane, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -438,7 +437,6 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
         if const_lane(*at, p.wave64).ok_or(())? != lane {
             return walk(
                 p,
-                st,
                 def_site,
                 phi_at,
                 inst.read(Reg::V(reg)).ok_or(())?,
@@ -448,13 +446,7 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
         }
         let spill = match *value {
             Operand::Scalar { code: NULL, .. } => Spill::Const(0),
-            Operand::Scalar { code, .. } => {
-                let sv = inst.read(Reg::S(code)).ok_or(())?;
-                if st.masks.contains_key(&sv) || st.highs.contains_key(&sv) {
-                    return Err(());
-                }
-                Spill::Value(sv)
-            }
+            Operand::Scalar { code, .. } => Spill::Value(inst.read(Reg::S(code)).ok_or(())?),
             Operand::Literal(x) => Spill::Const(x),
             Operand::Const(c) => Spill::Const(crate::resource::inline(c).ok_or(())?),
             _ => return Err(()),
@@ -482,10 +474,13 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
             else {
                 continue;
             };
-            if let Ok(Some(spill)) = walk(p, st, &def_site, &phi_at, vgpr_val, lane, &mut Vec::new())
-            {
+            if let Ok(Some(spill)) = walk(p, &def_site, &phi_at, vgpr_val, lane, &mut Vec::new()) {
+                let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
                 let ok = match spill {
                     Spill::Const(_) => true,
+                    // A mask comes back as a mask only where the lane pass
+                    // took the read for it.
+                    Spill::Value(sv) if is_mask(sv) => inst.writes.iter().any(|&(_, w)| is_mask(w)),
                     Spill::Value(sv) => def_block.get(&sv).is_some_and(|&db| dominates(db, b)),
                 };
                 if ok {
@@ -4246,6 +4241,15 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 if let Some(&spill) = self.resolved_reads.get(&site) {
+                    // A spilled mask: its readers take the lanes' bits.
+                    if let Spill::Value(sv) = spill
+                        && (self.x.st.masks.contains_key(&sv) || self.x.st.highs.contains_key(&sv))
+                    {
+                        for &(_, w) in &inst.writes {
+                            self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
+                        }
+                        return Ok(());
+                    }
                     let r = match spill {
                         Spill::Value(val) => self.i32_of(val)?,
                         Spill::Const(k) => self.s.m.i32(k),
