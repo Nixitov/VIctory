@@ -532,8 +532,9 @@ impl ListRef {
 /// What is left of a submission once the GPU has run it.
 struct Pending {
     lists: Vec<ListRef>,
-    /// The ranges its shaders write (host copy, address, bytes), each once.
-    back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The ranges its shaders write (host copy, and each address and bytes
+    /// it declared).
+    back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     submitted: std::time::Instant,
@@ -544,7 +545,7 @@ impl Pending {
     /// work writes (copied back, written at the bottom of the pipe) and
     /// reads (host copies and textures brought up to date for it).
     fn of(runs: &[&HostList]) -> (Pending, Touches) {
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         let (mut writes, mut touches) = (Vec::new(), Touches::default());
         // One list's lock at a time: a submission may name a list twice.
         for list in runs {
@@ -554,10 +555,12 @@ impl Pending {
                     Step::GpuWrite(shadow, address, len) => {
                         let copy = std::sync::Arc::as_ptr(shadow) as usize;
                         touches.shaders.push((copy, *address, address + len));
-                        if !back.iter().any(|(s, a, l)| {
-                            std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                        }) {
-                            back.push((shadow.clone(), *address, *len));
+                        match back
+                            .iter_mut()
+                            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                        {
+                            Some((_, ranges)) => ranges.push((*address, *len)),
+                            None => back.push((shadow.clone(), vec![(*address, *len)])),
                         }
                     }
                     Step::Refresh(_, address, len) => touches.reads.push((*address, address + len)),
@@ -948,13 +951,10 @@ impl Host {
                 "slow host submission"
             );
         }
-        // What shaders wrote goes back before the bottom-of-pipe writes;
-        // each range once per submission, however many dispatches declared
-        // it (the world's passes declare the same big ranges dozens of
-        // times).
+        // What shaders wrote goes back before the bottom-of-pipe writes.
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(*address, *len);
+        for (shadow, ranges) in &p.back {
+            let written = shadow.copy_back(ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
