@@ -74,12 +74,6 @@ pub(crate) enum C {
     /// Every command-list call: its time and count.
     ListCallUs,
     ListCalls,
-    /// Write-watch asks from [`crate::shadow::Shadow::stale`], and their time.
-    StaleWatches,
-    StaleUs,
-    /// Of the write-watch asks: the kernel's and the guard path's time.
-    WatchKernelUs,
-    WatchGuardUs,
     /// Time in the kernel's write-watch answers, in the view check of the
     /// guard, in protecting; bytes and time of copies of memory neither
     /// watched nor guarded (copied whole).
@@ -129,7 +123,7 @@ pub(crate) enum C {
     CompareBytes,
     CompareUs,
 }
-const COUNTERS: usize = 79;
+const COUNTERS: usize = 75;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -347,14 +341,6 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackGuard as usize]),
         c[C::WriteCalls as usize],
         c[C::WriteFails as usize],
-    );
-    tracing::info!(
-        "watches in detail: {:.0} stale asks {:.1} ms; {:.1} ms in the kernel, \
-         {:.1} ms guarding view memory",
-        c[C::StaleWatches as usize],
-        ms(c[C::StaleUs as usize]),
-        ms(c[C::WatchKernelUs as usize]),
-        ms(c[C::WatchGuardUs as usize]),
     );
     tracing::info!(
         "of the title's calls: {:.2} ms in {} draws, dispatches and copies",
