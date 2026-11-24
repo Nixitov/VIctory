@@ -96,4 +96,6 @@ to the per-lane load or choice that gives each lane its own (a mask's
 the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
-lists what they cannot handle yet.
+lists what they cannot handle yet; with `--cache DIR` it also stores every
+translation in the runtime's shader cache, keyed as the runtime will read
+it.

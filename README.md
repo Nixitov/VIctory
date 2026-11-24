@@ -93,6 +93,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+                  [--cache DIR]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -100,6 +101,11 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+`translate --cache DIR` stores each translation in the shader cache
+`run` reads (`cache_dir\shaders`, see `victory config`), removing that
+translation from the frames that first meet it. Fill it with the same
+executable that will run the title.
 
 ## Debugging
 
