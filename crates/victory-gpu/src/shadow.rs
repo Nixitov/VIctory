@@ -211,21 +211,75 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackCompared, n as u64);
+                #[cfg(feature = "diagnostics")]
+                let reading = std::time::Instant::now();
+                let differs =
+                    host != old && crate::host::read_into((start + at) as *const u8, title);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::BackRead,
+                    reading.elapsed().as_micros() as u64,
+                );
+                if differs {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
+                    #[cfg(feature = "diagnostics")]
+                    let merging = std::time::Instant::now();
+                    // Pages of the piece that take the GPU's bytes: written
+                    // back a page run at a time, since a piece's changed
+                    // bytes are often a few counters.
+                    let mut dirty = [false; PIECE / PAGE + 1];
+                    let mut offset = 0;
                     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            dirty[(offset / PAGE).min(dirty.len() - 1)] = true;
                         }
                         *h = *t;
+                        offset += 1;
                     }
-                    if changed {
+                    debug_assert_eq!(offset, n);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::BackMerge,
+                        merging.elapsed().as_micros() as u64,
+                    );
+                    if dirty.iter().any(|&d| d) {
+                        #[cfg(feature = "diagnostics")]
+                        let guarding = std::time::Instant::now();
                         crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(
+                            crate::copystat::C::BackGuard,
+                            guarding.elapsed().as_micros() as u64,
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        let writing = std::time::Instant::now();
+                        let mut page = 0;
+                        while page < dirty.len() {
+                            if !dirty[page] {
+                                page += 1;
+                                continue;
+                            }
+                            let first = page;
+                            while page < dirty.len() && dirty[page] {
+                                page += 1;
+                            }
+                            let (from, to) = (first * PAGE, (page * PAGE).min(n));
+                            crate::host::write_mapped(
+                                (start + at + from) as *mut u8,
+                                title[from..].as_ptr(),
+                                to - from,
+                            );
+                            written += to - from;
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(
+                            crate::copystat::C::BackWrite,
+                            writing.elapsed().as_micros() as u64,
+                        );
                     }
                     synced.push((start + at) / PAGE);
                 }

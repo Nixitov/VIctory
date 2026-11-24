@@ -42,8 +42,19 @@ pub(crate) enum C {
     CopyCommitted,
     CopyGuard,
     CopyFallback,
+    /// Of copying shader writes back: bytes compared with the snapshot, and
+    /// the time reading title memory, merging the bytes, writing them, and
+    /// opening the guards before a write.
+    BackCompared,
+    BackRead,
+    BackMerge,
+    BackWrite,
+    BackGuard,
+    /// Writes attempted and failed: a failed one halves its range.
+    WriteCalls,
+    WriteFails,
 }
-const COUNTERS: usize = 25;
+const COUNTERS: usize = 32;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -138,6 +149,17 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::CopyCommitted as usize]),
         ms(c[C::CopyGuard as usize]),
         ms(c[C::CopyFallback as usize]),
+    );
+    tracing::info!(
+        "of copying shader writes back: {:.1} MB compared, {:.1} ms reading title memory, \
+         {:.1} ms merging, {:.1} ms writing ({:.1} ms opening guards; {:.1} writes, {:.1} failed)",
+        mb(c[C::BackCompared as usize]),
+        ms(c[C::BackRead as usize]),
+        ms(c[C::BackMerge as usize]),
+        ms(c[C::BackWrite as usize]),
+        ms(c[C::BackGuard as usize]),
+        c[C::WriteCalls as usize],
+        c[C::WriteFails as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
