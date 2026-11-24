@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
@@ -203,6 +203,14 @@ impl CacheFill {
     }
 }
 
+/// What the walk has reached, for the periodic progress line (a title's
+/// archives take minutes, and the report only comes at the end).
+#[derive(Default)]
+struct Progress {
+    containers: AtomicUsize,
+    programs: AtomicUsize,
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -244,6 +252,28 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let progress = Arc::new(Progress::default());
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let progress = progress.clone();
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut tick = 0;
+            let mut said = 0;
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                tick += 1;
+                let containers = progress.containers.load(Ordering::Relaxed);
+                if tick % 10 == 0 && containers != said {
+                    said = containers;
+                    eprintln!(
+                        "translate    {containers} containers, {} programs so far",
+                        progress.programs.load(Ordering::Relaxed)
+                    );
+                }
+            }
+        })
+    };
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -275,7 +305,7 @@ pub fn run(
                             cache: filling,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, entry.path(), &seen, &progress, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -283,6 +313,8 @@ pub fn run(
             });
         }
     }
+    done.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
@@ -393,6 +425,7 @@ fn translate(
     source: &Source,
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
+    progress: &Progress,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -401,6 +434,7 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
+    progress.containers.fetch_add(1, Ordering::Relaxed);
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
@@ -433,6 +467,7 @@ fn translate(
     });
     for (index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
+        progress.programs.fetch_add(1, Ordering::Relaxed);
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(program) => {
                 t.translated += 1;
