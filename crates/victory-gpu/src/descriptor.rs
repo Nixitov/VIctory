@@ -66,6 +66,32 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     unsafe { &*this.cast::<Heap>() }
 }
 
+/// A shader-visible view heap for tests, as [`create_heap`] makes one from
+/// the title's description but without a device object: a state that binds
+/// root SRVs as one-view tables (see
+/// [`crate::pipeline::host::bounded_root_srvs`]) needs one bound, as the
+/// game has. Leaked; the test binary ends with it.
+#[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    let count = count.max(1);
+    let size = u64::from(increment(VIEWS_KIND).expect("a view descriptor size")) * u64::from(count);
+    let memory = Memory::zeroed(size, 64).expect("view heap memory");
+    let heap = Box::new(Heap {
+        object: Object::new(&FUNCTIONS),
+        desc: HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        },
+        start: memory.address(),
+        memory: Some(memory),
+        host: std::sync::OnceLock::new(),
+        pending: Default::default(),
+    });
+    Box::into_raw(heap) as This
+}
+
 impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
