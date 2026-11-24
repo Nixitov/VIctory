@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+use victory_shader::emit::{self, WaveRange, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -71,6 +71,9 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// With `--cache`: entries written, and writes that failed.
+    cache_stored: usize,
+    cache_errors: usize,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -133,6 +136,8 @@ impl Tally {
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
+        self.cache_stored += other.cache_stored;
+        self.cache_errors += other.cache_errors;
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
@@ -150,6 +155,52 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// With `--cache`: store what is emitted in the runtime's cache.
+    cache: Option<Filling>,
+}
+
+/// A `--cache` run's target, one copy per thread.
+#[derive(Clone, Copy)]
+struct Filling {
+    /// The wave sizes the runtime's host reports; the translation and the
+    /// entry's key both carry them, so this must be the host's answer.
+    waves: Option<WaveRange>,
+}
+
+/// A shader cache directory `--cache` fills.
+struct CacheFill {
+    dir: PathBuf,
+    waves: Option<WaveRange>,
+}
+
+impl CacheFill {
+    fn open(dir: PathBuf) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            victory_gpu::shader_cache::use_shader_cache(dir.clone());
+            anyhow::ensure!(
+                victory_gpu::shader_cache::ready(),
+                "cannot open a shader cache at {}",
+                dir.display()
+            );
+            // The host device the runtime translates with; None if there
+            // is none, which the runtime's entries then also carry.
+            let waves = victory_gpu::shader_cache::host_waves();
+            Ok(CacheFill { dir, waves })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = dir;
+            anyhow::bail!("a shader cache exists only in a Windows build")
+        }
+    }
+
+    fn waves_name(&self) -> String {
+        match self.waves {
+            Some(w) => format!("{}..{}", w.min, w.max),
+            None => "console".to_owned(),
+        }
+    }
 }
 
 pub fn run(
@@ -158,6 +209,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    cache: Option<PathBuf>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -172,6 +224,15 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    let cache = cache.map(CacheFill::open).transpose()?;
+    if let Some(c) = &cache {
+        println!(
+            "cache        filling {} for host wave sizes {}",
+            c.dir.display(),
+            c.waves_name()
+        );
+    }
+    let filling = cache.as_ref().map(|c| Filling { waves: c.waves });
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -211,6 +272,7 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            cache: filling,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -288,6 +350,7 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
+    let stored = (t.cache_stored, t.cache_errors);
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -298,7 +361,32 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    if let Some(c) = &cache {
+        println!(
+            "cache        {} entries stored in {}{}",
+            stored.0,
+            c.dir.display(),
+            if stored.1 > 0 {
+                format!(" ({} writes failed)", stored.1)
+            } else {
+                String::new()
+            }
+        );
+    }
     Ok(())
+}
+
+/// Stores a translation of `container` in the `--cache` directory, if one
+/// is being filled.
+fn store(t: &mut Tally, checks: &Checks, container: &[u8], shader: &emit::HostShader) {
+    if checks.cache.is_none() {
+        return;
+    }
+    if victory_gpu::shader_cache::store(container, shader) {
+        t.cache_stored += 1;
+    } else {
+        t.cache_errors += 1;
+    }
 }
 
 fn translate(
@@ -321,13 +409,29 @@ fn translate(
     };
     if !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
+        // The report counts this container once, but the cache holds an
+        // entry per container: translate this one as the runtime would.
+        if let Some(fill) = checks.cache
+            && let Ok(shader) = emit::translate_for(container.bytes(), fill.waves)
+        {
+            store(t, checks, container.bytes(), &shader);
+        }
         return;
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    for p in programs {
+    // The runtime's cache holds one program per container, the one
+    // `emit::translate_for` picks: the first vertex, pixel, compute or
+    // mesh program. Storing another would answer with the wrong stage.
+    let cached_program = programs.iter().position(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+        )
+    });
+    for (index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(program) => {
@@ -390,10 +494,16 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let host_waves = checks.host.as_ref().and_then(|(h, _)| h.wave_range());
+                    let host_waves = match checks.cache {
+                        Some(fill) => fill.waves,
+                        None => checks.host.as_ref().and_then(|(h, _)| h.wave_range()),
+                    };
                     match emit::emit_for(&container, &p, &program, &s, &i, &r, host_waves) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            if cached_program == Some(index) {
+                                store(t, checks, container.bytes(), &shader);
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
