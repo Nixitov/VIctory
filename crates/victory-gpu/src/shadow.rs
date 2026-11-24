@@ -76,6 +76,8 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+/// View memory: guarded, not write-watched ([`crate::watch::view_writes`]).
+const GUARDED: u8 = 3;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written by the submitting thread, and by the thread finishing an earlier
@@ -325,7 +327,7 @@ impl Shadow {
         if first < last
             && !synced.is_empty()
             && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+            && let Some((now, _, _)) = self.asked(first * PAGE, last * PAGE)
         {
             let base = start / PAGE;
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -386,9 +388,19 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
-        let Some((_, written)) = crate::watch::writes(from, to, true) else {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let Some((_, written, _)) = self.asked(from, to) else {
             return true;
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::StaleWatches, 1);
+            crate::copystat::add(
+                crate::copystat::C::StaleUs,
+                started.elapsed().as_micros() as u64,
+            );
+        }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         (from / PAGE..=(to - 1) / PAGE).any(|page| {
@@ -404,8 +416,9 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+            if let Some((now, written, view)) = self.asked(from, to) {
+                self.watched
+                    .store(if view { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -419,6 +432,17 @@ impl Shadow {
         }
         self.copy(from, to);
         to - from
+    }
+
+    /// The write journal's answer for `[from, to)`: ask the kernel for
+    /// write-watched memory, and for view memory (known to be guarded) guard
+    /// it without the ask, which fails there every time.
+    fn asked(&self, from: usize, to: usize) -> Option<(u64, Vec<(usize, u64)>, bool)> {
+        if self.watched.load(Ordering::Relaxed) == GUARDED {
+            crate::watch::view_writes(from, to)
+        } else {
+            crate::watch::writes(from, to, true)
+        }
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
