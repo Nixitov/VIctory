@@ -193,37 +193,23 @@ impl Shadow {
     /// are merged first: the world declares overlapping views of its big
     /// heap dozens of times per submission, and each byte is compared with
     /// the snapshot once. Returns the bytes written.
-    pub(crate) fn copy_back(&self, ranges: &[(usize, usize)]) -> usize {
-        // The ranges as offsets in the copy, overlapping ones merged.
-        let mut spans: Vec<(usize, usize)> = ranges
-            .iter()
-            .map(|&(address, len)| self.inside(address, len))
-            .filter(|&(from, to)| from < to)
-            .collect();
-        spans.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-        for (from, to) in spans {
-            match merged.last_mut() {
-                Some((_, last)) if from <= *last => *last = (*last).max(to),
-                _ => merged.push((from, to)),
-            }
-        }
+    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let (from, to) = self.inside(address, len);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        if let Some((taken, before)) = &*snapshot {
-            for &(from, to) in &merged {
-                if *taken <= from && to <= taken + before.len() {
-                    written += self.copy_back_span(&before[from - *taken..to - *taken], from, to);
-                }
-            }
+        if let Some((taken, before)) = &*snapshot
+            && *taken <= from
+            && to <= taken + before.len()
+            && from < to
+        {
+            written = self.copy_back_span(&before[from - *taken..to - *taken], from, to);
         }
-        // Every submitted step that declared a range is done with it
+        // Every submitted step that declared the range is done with it
         // (submissions in flight do not declare overlapping ranges of a
         // copy: a later one finishes the earlier first), and the snapshot
         // with the last range.
-        let ends: Vec<(usize, usize)> = ranges.iter().map(|&(at, len)| (at, at + len)).collect();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|r| !ends.contains(r));
+        pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
