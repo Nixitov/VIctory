@@ -59,6 +59,9 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
+    /// The container's bytes, cut where its header says it ends: callers
+    /// that found it in a larger buffer (a file, a record) hash this.
+    bytes: &'a [u8],
 }
 
 const HEADER_SIZE: usize = 0x20;
@@ -103,11 +106,17 @@ impl<'a> Container<'a> {
             digest,
             version,
             parts,
+            bytes: data,
         })
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
+    }
+
+    /// The container's bytes, exactly as its header sizes them.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 }
 
@@ -166,6 +175,15 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+    }
+
+    #[test]
+    fn bytes_stop_where_the_header_says() {
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        let len = bytes.len();
+        bytes.extend_from_slice(b"trailing bytes from the file around it");
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.bytes(), &bytes[..len]);
     }
 
     #[test]

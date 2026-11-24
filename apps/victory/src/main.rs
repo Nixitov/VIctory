@@ -84,6 +84,11 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Store every translation in this shader cache directory, as
+        /// `victory run` reads it (the default is
+        /// `cache_dir/shaders`, see `victory config`).
+        #[arg(long, value_name = "DIR")]
+        cache: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -152,7 +157,8 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            cache,
+        } => translate::run(paths, validate, pipelines, list, jobs, cache),
         Command::Run {
             exe,
             unimplemented,
