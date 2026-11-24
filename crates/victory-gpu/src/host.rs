@@ -950,14 +950,13 @@ impl Host {
                 "slow host submission"
             );
         }
-        // What shaders wrote goes back before the bottom-of-pipe writes;
-        // each range once per submission, however many dispatches declared
-        // it (the world's passes declare the same big ranges dozens of
-        // times).
+        // What shaders wrote goes back before the bottom-of-pipe writes.
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(*address, *len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if !skipping("copy-back") {
+            for (shadow, address, len) in &p.back {
+                let written = shadow.copy_back(*address, *len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for &(at, what, bytes) in &p.writes {
@@ -1830,6 +1829,9 @@ impl Batch<'_> {
 
     /// Brings `[from, to)` of `shadow`'s host copy up to date now.
     fn update(&self, shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        if skipping("refresh") {
+            return;
+        }
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
@@ -1845,6 +1847,29 @@ impl Batch<'_> {
             self.update(&shadow, from, to);
         }
     }
+}
+
+/// Experiment switches: skip a whole kind of work to measure what it costs.
+/// Each makes the picture wrong (`refresh` leaves host copies stale,
+/// `copy-back` never returns shader writes), so they are for timing only.
+pub(crate) fn skipping(what: &str) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_SKIP")
+            .map(|v| v.split(',').map(|s| s.trim().to_owned()).collect())
+            .unwrap_or_default()
+    });
+    list.iter().any(|s| s == what)
+}
+
+/// Whether presenting returns before the frame's submissions finished
+/// (`VICTORY_PRESENT_ASYNC=1`): the title's own fences then decide when it
+/// waits, and the CPU can prepare the next frame while the GPU runs this
+/// one. Off by default: a title may take a present as the GPU being done
+/// with the frame's memory.
+fn present_async() -> bool {
+    static ASYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASYNC.get_or_init(|| matches!(std::env::var("VICTORY_PRESENT_ASYNC").as_deref(), Ok("1")))
 }
 
 /// Copies title memory at submission. The ranges were checked against their

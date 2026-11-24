@@ -56,8 +56,31 @@ pub(crate) enum C {
     /// Writes attempted and failed: a failed one halves its range.
     WriteCalls,
     WriteFails,
+<<<<<<< HEAD
 }
 const COUNTERS: usize = 35;
+=======
+    /// Time in the title's draw, dispatch and copy entry points, and how
+    /// many calls.
+    EntryUs,
+    EntryCalls,
+    /// Of a title call: preparing it (bindings, vertex buffers, targets) and
+    /// the driver's draw call itself; of preparing, making its tables.
+    DrawPrepUs,
+    DrawTablesUs,
+    DrawCallUs,
+    Draws,
+    /// Table lookups that found the table already made, that had to make it,
+    /// and the descriptor slots made with it.
+    TableHits,
+    TableMisses,
+    TableEntries,
+    /// Every command-list call: its time and count.
+    ListCallUs,
+    ListCalls,
+}
+const COUNTERS: usize = 46;
+>>>>>>> feb9aff (GPU: kill-switches to time a whole kind of work, and command-list call totals)
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -174,6 +197,33 @@ pub(crate) fn log(frames: f64) {
         c[C::WriteCalls as usize],
         c[C::WriteFails as usize],
     );
+<<<<<<< HEAD
+=======
+    tracing::info!(
+        "of the title's calls: {:.2} ms in {} draws, dispatches and copies",
+        ms(c[C::EntryUs as usize]),
+        c[C::EntryCalls as usize],
+    );
+    tracing::info!(
+        "of a draw: {:.1} ms preparing (of which {:.1} ms tables), {:.1} ms in the driver's call, \
+         {:.0} draws",
+        ms(c[C::DrawPrepUs as usize]),
+        ms(c[C::DrawTablesUs as usize]),
+        ms(c[C::DrawCallUs as usize]),
+        c[C::Draws as usize],
+    );
+    tracing::info!(
+        "tables: {:.0} hits, {:.0} misses, {:.0} descriptor slots made",
+        c[C::TableHits as usize],
+        c[C::TableMisses as usize],
+        c[C::TableEntries as usize],
+    );
+    tracing::info!(
+        "command lists: {:.1} ms in {} calls",
+        ms(c[C::ListCallUs as usize]),
+        c[C::ListCalls as usize],
+    );
+>>>>>>> feb9aff (GPU: kill-switches to time a whole kind of work, and command-list call totals)
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
