@@ -2,14 +2,13 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, WaveRange, validator::Validator};
+use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -72,9 +71,6 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
-    /// With `--cache`: entries written, and writes that failed.
-    cache_stored: usize,
-    cache_errors: usize,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -137,8 +133,6 @@ impl Tally {
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
-        self.cache_stored += other.cache_stored;
-        self.cache_errors += other.cache_errors;
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
@@ -156,60 +150,6 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
-    /// With `--cache`: store what is emitted in the runtime's cache.
-    cache: Option<Filling>,
-}
-
-/// A `--cache` run's target, one copy per thread.
-#[derive(Clone, Copy)]
-struct Filling {
-    /// The wave sizes the runtime's host reports; the translation and the
-    /// entry's key both carry them, so this must be the host's answer.
-    waves: Option<WaveRange>,
-}
-
-/// A shader cache directory `--cache` fills.
-struct CacheFill {
-    dir: PathBuf,
-    waves: Option<WaveRange>,
-}
-
-impl CacheFill {
-    fn open(dir: PathBuf) -> Result<Self> {
-        #[cfg(windows)]
-        {
-            victory_gpu::shader_cache::use_shader_cache(dir.clone());
-            anyhow::ensure!(
-                victory_gpu::shader_cache::ready(),
-                "cannot open a shader cache at {}",
-                dir.display()
-            );
-            // The host device the runtime translates with; None if there
-            // is none, which the runtime's entries then also carry.
-            let waves = victory_gpu::shader_cache::host_waves();
-            Ok(CacheFill { dir, waves })
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = dir;
-            anyhow::bail!("a shader cache exists only in a Windows build")
-        }
-    }
-
-    fn waves_name(&self) -> String {
-        match self.waves {
-            Some(w) => format!("{}..{}", w.min, w.max),
-            None => "console".to_owned(),
-        }
-    }
-}
-
-/// What the walk has reached, for the periodic progress line (a title's
-/// archives take minutes, and the report only comes at the end).
-#[derive(Default)]
-struct Progress {
-    containers: AtomicUsize,
-    programs: AtomicUsize,
 }
 
 pub fn run(
@@ -218,7 +158,6 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
-    cache: Option<PathBuf>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -233,15 +172,6 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let cache = cache.map(CacheFill::open).transpose()?;
-    if let Some(c) = &cache {
-        println!(
-            "cache        filling {} for host wave sizes {}",
-            c.dir.display(),
-            c.waves_name()
-        );
-    }
-    let filling = cache.as_ref().map(|c| Filling { waves: c.waves });
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -253,28 +183,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    let progress = Arc::new(Progress::default());
-    let done = Arc::new(AtomicBool::new(false));
-    let watcher = {
-        let progress = progress.clone();
-        let done = done.clone();
-        std::thread::spawn(move || {
-            let mut tick = 0;
-            let mut said = 0;
-            while !done.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                tick += 1;
-                let containers = progress.containers.load(Ordering::Relaxed);
-                if tick % 10 == 0 && containers != said {
-                    said = containers;
-                    eprintln!(
-                        "translate    {containers} containers, {} programs so far",
-                        progress.programs.load(Ordering::Relaxed)
-                    );
-                }
-            }
-        })
-    };
+    let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -289,33 +198,41 @@ pub fn run(
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                            cache: filling,
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &progress, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
-                }
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut t = Tally {
+                                list,
+                                ..Tally::default()
+                            };
+                            let mut checks = Checks {
+                                keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                validator: validate
+                                    .then(|| Validator::load(dll.as_deref()).ok())
+                                    .flatten(),
+                                host: pipelines
+                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                    .flatten(),
+                            };
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            }
+                            lock(&total).merge(t);
+                        })
+                    })
+                    .collect();
+                report(
+                    entry.path(),
+                    jobs.len(),
+                    "containers",
+                    &next,
+                    started,
+                    &workers,
+                    String::new,
+                );
             });
         }
     }
-    done.store(true, Ordering::Relaxed);
-    let _ = watcher.join();
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
@@ -383,7 +300,6 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
-    let stored = (t.cache_stored, t.cache_errors);
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -394,57 +310,172 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
-    if let Some(c) = &cache {
-        println!(
-            "cache        {} entries stored in {}{}",
-            stored.0,
-            c.dir.display(),
-            if stored.1 > 0 {
-                format!(" ({} writes failed)", stored.1)
-            } else {
-                String::new()
+    Ok(())
+}
+
+/// The warm-up (`--cache`): every distinct container found goes through
+/// the shader cache `run` reads (`<cache>/shaders`, decision 0003), by the
+/// same code, so a run finds it translated or refused. With `pipelines`,
+/// then the shader pack's pipelines go into the pipeline library
+/// (`prebuild`).
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
+    let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
+        anyhow::bail!("no shader cache in {}", shaders.display());
+    };
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    // The pre-build's key listing (diagnostics) translates nothing.
+    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
+        return crate::prebuild::run(&paths, threads);
+    }
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    // Containers already cached, translated now, refused now.
+    let counts = [const { AtomicUsize::new(0) }; 3];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
             }
-        );
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                let Some(bytes) = job.bytes() else { continue };
+                                // As the title passes it: the container's own size
+                                // (a raw source runs on to the end of the file).
+                                let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+                                    u32::from_le_bytes(b.try_into().expect("4")) as usize
+                                });
+                                let container = &bytes[..size.min(bytes.len())];
+                                let hash = blake3::hash(container);
+                                if !lock(&seen).insert(hash) {
+                                    continue;
+                                }
+                                let one = std::time::Instant::now();
+                                let (done, cached) =
+                                    victory_gpu::shader_cache::host_shader(container);
+                                let k = if cached {
+                                    0
+                                } else if done.is_ok() {
+                                    1
+                                } else {
+                                    2
+                                };
+                                counts[k].fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    hash = %&hash.to_hex()[..16],
+                                    ms = one.elapsed().as_millis() as u64,
+                                    cached,
+                                    ok = done.is_ok(),
+                                    "warm-up"
+                                );
+                            }
+                        })
+                    })
+                    .collect();
+                let [c, t, r] = &counts;
+                report(
+                    entry.path(),
+                    jobs.len(),
+                    "containers",
+                    &next,
+                    started,
+                    &workers,
+                    || {
+                        let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+                        format!(
+                            "; all files so far: {} cached, {} translated, {} refused",
+                            n(c),
+                            n(t),
+                            n(r)
+                        )
+                    },
+                );
+            });
+        }
+    }
+    let [cached, translated, refused] = counts.map(AtomicUsize::into_inner);
+    let bytes: u64 = walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+    println!("cache        {} ({} MB)", dir.display(), bytes >> 20);
+    println!(
+        "containers   {} in {:.1} s: {cached} already cached, {translated} translated, {refused} refused",
+        cached + translated + refused,
+        started.elapsed().as_secs_f64()
+    );
+    if pipelines {
+        crate::prebuild::run(&paths, threads)?;
     }
     Ok(())
 }
 
-/// Stores a translation of `container` in the `--cache` directory, if one
-/// is being filled.
-fn store(t: &mut Tally, checks: &Checks, container: &[u8], shader: &emit::HostShader) {
-    if checks.cache.is_none() {
+/// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
+/// hands them out) until they finish: on a terminal one line rewritten
+/// every second, else a line every 10 s; then the file's last line.
+pub(crate) fn report<T>(
+    file: &Path,
+    jobs: usize,
+    what: &str,
+    next: &AtomicUsize,
+    started: std::time::Instant,
+    workers: &[std::thread::ScopedJoinHandle<'_, T>],
+    extra: impl Fn() -> String,
+) {
+    use std::io::IsTerminal;
+    if workers.is_empty() {
         return;
     }
-    if victory_gpu::shader_cache::store(container, shader) {
-        t.cache_stored += 1;
-    } else {
-        t.cache_errors += 1;
-    }
-}
-
-/// With `VICTORY_NAME_SHADERS=<file>`: appends `<hash>\t<source>` for a shader
-/// container, where `<hash>` is the one the runtime logs for it, so a pipeline
-/// named by hash in a runtime log can be named by source.
-fn name_shader(container: &[u8], path: &Path, source: &Source) {
-    static OUT: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let Some(out) = OUT.get_or_init(|| {
-        let file = std::env::var_os("VICTORY_NAME_SHADERS")?;
-        std::fs::File::create(file).ok().map(Mutex::new)
-    }) else {
-        return;
+    let terminal = std::io::stderr().is_terminal();
+    let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
+    let line = || {
+        // `next` counts jobs handed out; a worker still running holds one.
+        let busy = workers.iter().filter(|w| !w.is_finished()).count();
+        let taken = next.load(Ordering::Relaxed).min(jobs);
+        let done = taken.saturating_sub(busy);
+        format!(
+            "{}: {done} of {jobs} {what} ({}%), {:.0} s{}",
+            file.display(),
+            done * 100 / jobs.max(1),
+            started.elapsed().as_secs_f64(),
+            extra()
+        )
     };
-    let hash = blake3::hash(container).to_hex()[..16].to_string();
-    let line = format!("{hash}\t{}{}\n", path.display(), source.label());
-    if let Ok(mut file) = out.lock() {
-        let _ = file.write_all(line.as_bytes());
+    let mut shown = std::time::Instant::now();
+    while !workers.iter().all(|w| w.is_finished()) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if shown.elapsed() >= every {
+            shown = std::time::Instant::now();
+            if terminal {
+                eprint!("\r{}", line());
+            } else {
+                eprintln!("{}", line());
+            }
+        }
     }
+    eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
 }
 
 fn translate(
     source: &Source,
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
-    progress: &Progress,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -453,48 +484,32 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
-    progress.containers.fetch_add(1, Ordering::Relaxed);
-    name_shader(&bytes, path, source);
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or(container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     if !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
-        // The report counts this container once, but the cache holds an
-        // entry per container: translate this one as the runtime would.
-        if let Some(fill) = checks.cache
-            && let Ok(shader) = emit::translate_for(container.bytes(), fill.waves)
-        {
-            store(t, checks, container.bytes(), &shader);
-        }
         return;
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    // The runtime's cache holds one program per container, the one
-    // `emit::translate_for` picks: the first vertex, pixel, compute or
-    // mesh program. Storing another would answer with the wrong stage.
-    let cached_program = programs.iter().position(|p| {
-        matches!(
-            p.stage,
-            HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-        )
-    });
-    for (index, p) in programs.into_iter().enumerate() {
+    for p in programs {
         t.programs += 1;
-        progress.programs.fetch_add(1, Ordering::Relaxed);
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
+        match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
+            Ok((program, structured)) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
-                let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
@@ -549,16 +564,9 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let host_waves = match checks.cache {
-                        Some(fill) => fill.waves,
-                        None => checks.host.as_ref().and_then(|(h, _)| h.wave_range()),
-                    };
-                    match emit::emit_for(&container, &p, &program, &s, &i, &r, host_waves) {
+                    match emit::emit(&container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
-                            if cached_program == Some(index) {
-                                store(t, checks, container.bytes(), &shader);
-                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -738,9 +746,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
-        // tables are no root parameter.
+        // tables and title memory are no root parameter.
         if let Some(a) = a
-            && a.param != resource::CODE
+            && a.param < p.layout.len()
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap
