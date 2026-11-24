@@ -315,10 +315,6 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
-    pub(crate) fn has_root_uavs(&self) -> bool {
-        self.stages.iter().any(|s| !s.root_uavs.is_empty())
-    }
-
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {

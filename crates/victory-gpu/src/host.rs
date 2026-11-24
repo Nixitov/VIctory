@@ -472,6 +472,9 @@ struct Retired {
     deferred: Deferred,
     scratch: Scratch,
     states: States,
+    /// Held (not read) until the submission has run: its prelude reads the
+    /// twins the list recorded, and title threads record again meanwhile.
+    #[allow(dead_code)]
     twins: std::collections::HashMap<usize, crate::twin::Use>,
     budget: Option<(ID3D12Resource, usize)>,
 }
