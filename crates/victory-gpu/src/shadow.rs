@@ -187,67 +187,22 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
+    /// records (a fence list read as -1, title+0x4e9b54a).
+    ///
+    /// `ranges` are every (address, length) the submission declared. They
+    /// are merged first: the world declares overlapping views of its big
+    /// heap dozens of times per submission, and each byte is compared with
+    /// the snapshot once. Returns the bytes written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let (from, to) = self.inside(address, len);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
-        let start = self.start as usize;
         if let Some((taken, before)) = &*snapshot
             && *taken <= from
             && to <= taken + before.len()
             && from < to
         {
-            let before = &before[from - taken..to - taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
-                }
-                at += n;
-            }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
-            }
+            written = self.copy_back_span(&before[from - *taken..to - *taken], from, to);
         }
         // Every submitted step that declared the range is done with it
         // (submissions in flight do not declare overlapping ranges of a
@@ -259,6 +214,116 @@ impl Shadow {
             && let Some((_, bytes)) = snapshot.take()
         {
             give_back(bytes);
+        }
+        written
+    }
+
+    /// [`Shadow::copy_back`] for one merged range: `before` is the copy's
+    /// bytes before the submission, for offsets `from..to`. Returns the
+    /// bytes written.
+    fn copy_back_span(&self, before: &[u8], from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        let mut written = 0;
+        // By 64 KiB piece: the copy compared with its bytes before the
+        // submission, title memory read only where the GPU wrote.
+        const PIECE: usize = 64 << 10;
+        let mut title = vec![0u8; PIECE];
+        let mut synced = Vec::new();
+        let mut at = from;
+        while at < to {
+            let n = (PIECE - (start + at) % PIECE).min(to - at);
+            // SAFETY: inside the mapping; only the submitting thread
+            // writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            let old = &before[at - from..at - from + n];
+            let title = &mut title[..n];
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackCompared, n as u64);
+            #[cfg(feature = "diagnostics")]
+            let reading = std::time::Instant::now();
+            let differs = host != old && crate::host::read_into((start + at) as *const u8, title);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::BackRead,
+                reading.elapsed().as_micros() as u64,
+            );
+            if differs {
+                // Title memory with the GPU's bytes put in; the copy
+                // takes the title's bytes in turn.
+                #[cfg(feature = "diagnostics")]
+                let merging = std::time::Instant::now();
+                // Pages of the piece that take the GPU's bytes: written
+                // back a page run at a time, since a piece's changed bytes
+                // are often a few counters.
+                let mut dirty = [false; PIECE / PAGE + 1];
+                let mut offset = 0;
+                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        dirty[(offset / PAGE).min(dirty.len() - 1)] = true;
+                    }
+                    *h = *t;
+                    offset += 1;
+                }
+                debug_assert_eq!(offset, n);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::BackMerge,
+                    merging.elapsed().as_micros() as u64,
+                );
+                if dirty.iter().any(|&d| d) {
+                    #[cfg(feature = "diagnostics")]
+                    let guarding = std::time::Instant::now();
+                    crate::watch::writing(start + at, n);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::BackGuard,
+                        guarding.elapsed().as_micros() as u64,
+                    );
+                    #[cfg(feature = "diagnostics")]
+                    let writing = std::time::Instant::now();
+                    let mut page = 0;
+                    while page < dirty.len() {
+                        if !dirty[page] {
+                            page += 1;
+                            continue;
+                        }
+                        let first = page;
+                        while page < dirty.len() && dirty[page] {
+                            page += 1;
+                        }
+                        let (from, to) = (first * PAGE, (page * PAGE).min(n));
+                        crate::host::write_mapped(
+                            (start + at + from) as *mut u8,
+                            title[from..].as_ptr(),
+                            to - from,
+                        );
+                        written += to - from;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        crate::copystat::C::BackWrite,
+                        writing.elapsed().as_micros() as u64,
+                    );
+                }
+                synced.push((start + at) / PAGE);
+            }
+            at += n;
+        }
+        // Pages made equal to title memory are current in the copy, so our
+        // own write is not taken for the title's; others keep what they had
+        // (a title write there shows at the next refresh).
+        let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+        if first < last
+            && !synced.is_empty()
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+        {
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                copied[page - base] = now;
+            }
         }
         written
     }

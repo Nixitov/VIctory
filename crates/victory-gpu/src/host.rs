@@ -1951,9 +1951,17 @@ fn write(at: usize, src: *const u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the source is mapped memory of `len` bytes; the kernel checks
     // the destination.
-    unsafe {
+    let whole = unsafe {
         WriteProcessMemory(GetCurrentProcess(), at as _, src.cast(), len, &mut done) != 0
+    };
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::WriteCalls, 1);
+        if !whole {
+            crate::copystat::add(crate::copystat::C::WriteFails, 1);
+        }
     }
+    whole
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -1961,6 +1969,35 @@ fn write(at: usize, src: *const u8, len: usize) -> bool {
 /// range; a range that fails is halved (see [`copy_span`]) so an unmapped
 /// page costs a handful of writes rather than one per page.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::write_plain() {
+        // SAFETY: timing only: the caller vouches for both ends.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
+    // A fully mapped writable range takes a plain copy: the kernel's
+    // `WriteProcessMemory` runs at tens of MB/s on these heaps, a plain copy
+    // at GB/s. `VirtualProtect` accepts the range only if every page is
+    // committed and writable, and costs a fraction of the `VirtualQuery`
+    // walk `committed` does. Anything else goes through the kernel, which
+    // reports an unmapped page instead of faulting.
+    #[cfg(feature = "diagnostics")]
+    let checking = std::time::Instant::now();
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: title memory; only its protection is asked for (it is read-write
+    // already, ours are opened by the caller's `watch::writing`).
+    let mapped = unsafe { VirtualProtect(dst.cast(), len, PAGE_READWRITE, &mut old) } != 0;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::CopyCommitted,
+        checking.elapsed().as_micros() as u64,
+    );
+    if mapped {
+        // SAFETY: committed writable memory of `len` bytes, confirmed above.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
     write_span(dst as usize, src, dst as usize, len);
 }
 
