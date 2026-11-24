@@ -55,23 +55,38 @@ impl Cache {
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
-        let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
-        let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        let written = file.write_all(&output);
-        drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        published?;
+        publish(&path, &output)?;
         Ok(path)
     }
+
+    /// Publishes `output` as the entry for `input`, as `get_or_convert`
+    /// would have, replacing any entry already there.
+    pub fn store(&self, converter: &dyn Converter, input: &[u8], output: &[u8]) -> Result<PathBuf> {
+        let path = self.path_for(&CacheKey::new(converter, input));
+        publish(&path, output)?;
+        Ok(path)
+    }
+}
+
+/// Writes `output` at `path` atomically: readers see the whole entry or
+/// none of it.
+fn publish(path: &Path, output: &[u8]) -> Result<()> {
+    let dir = path.parent().expect("hashed path has a parent");
+    std::fs::create_dir_all(dir)?;
+    // Write-then-rename so readers never see partial output.
+    let tmp = tempfile_in(dir);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let written = file.write_all(output);
+    drop(file);
+    let published = written.and_then(|()| std::fs::rename(&tmp, path));
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    published?;
+    Ok(())
 }
 
 fn tempfile_in(dir: &Path) -> PathBuf {
@@ -136,6 +151,22 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn store_replaces_without_converting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.store(&conv, b"abc", b"FIRST").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"FIRST");
+        assert_eq!(cache.store(&conv, b"abc", b"SECOND").unwrap(), path);
+        assert_eq!(cache.get_or_convert(&conv, b"abc").unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"SECOND");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
