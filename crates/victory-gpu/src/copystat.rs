@@ -76,8 +76,6 @@ pub(crate) enum C {
     ListCalls,
 }
 const COUNTERS: usize = 46;
-const COUNTERS: usize = 46;
->>>>>>> feb9aff (GPU: kill-switches to time a whole kind of work, and command-list call totals)
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
