@@ -1417,6 +1417,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
+    let original = view;
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
@@ -1431,7 +1432,12 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
+            // A copy the title placed in its own memory holds the bytes a
+            // GPU write never reaches title memory with: take them from the
+            // resource that writes it instead of uploading.
+            let synced = crate::texture::sync_placed(list, *resource as This, original);
+            if !synced
+                && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
                 crate::texture::upload(list, *resource as This, t);
@@ -1535,7 +1541,7 @@ mod tests {
     use super::*;
     use victory_shader::native::{ComputeIo, StageIo};
     use victory_shader::{
-        Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+        HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
     };
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
@@ -1714,11 +1720,15 @@ mod tests {
         let res =
             victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = victory_shader::io::raise(&p, &native).unwrap();
-        let c = Container {
-            digest: [0; 16],
-            version: (1, 0),
-            parts: Vec::new(),
-        };
+        // An empty container (its bytes are private: parse one).
+        let mut dxbc = Vec::new();
+        dxbc.extend_from_slice(b"DXBC");
+        dxbc.extend_from_slice(&[0; 16]);
+        dxbc.extend_from_slice(&1u16.to_le_bytes());
+        dxbc.extend_from_slice(&0u16.to_le_bytes());
+        dxbc.extend_from_slice(&0x20u32.to_le_bytes());
+        dxbc.extend_from_slice(&0u32.to_le_bytes());
+        let c = victory_shader::dxbc::Container::parse(&dxbc).unwrap();
         let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
         (shader, used)
     }
