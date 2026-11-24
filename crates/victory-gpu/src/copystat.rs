@@ -71,8 +71,11 @@ pub(crate) enum C {
     TableHits,
     TableMisses,
     TableEntries,
+    /// Every command-list call: its time and count.
+    ListCallUs,
+    ListCalls,
 }
-const COUNTERS: usize = 44;
+const COUNTERS: usize = 46;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -207,6 +210,11 @@ pub(crate) fn log(frames: f64) {
         c[C::TableHits as usize],
         c[C::TableMisses as usize],
         c[C::TableEntries as usize],
+    );
+    tracing::info!(
+        "command lists: {:.1} ms in {} calls",
+        ms(c[C::ListCallUs as usize]),
+        c[C::ListCalls as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

@@ -141,7 +141,17 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(
+            crate::copystat::C::ListCallUs,
+            started.elapsed().as_micros() as u64,
+        );
+        crate::copystat::add(crate::copystat::C::ListCalls, 1);
+    }
 }
 
 /// The host list behind a title list, if there is a host GPU.
