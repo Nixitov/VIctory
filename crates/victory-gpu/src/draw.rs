@@ -356,6 +356,15 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let prepared = |started: std::time::Instant| {
+            crate::copystat::add(
+                crate::copystat::C::DrawPrepUs,
+                started.elapsed().as_micros() as u64,
+            )
+        };
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -367,6 +376,8 @@ impl State {
             return false;
         }
         if !self.bind(list, p, false) {
+            #[cfg(feature = "diagnostics")]
+            prepared(started);
             return false;
         }
         let l = &list.list;
@@ -419,6 +430,8 @@ impl State {
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
+        #[cfg(feature = "diagnostics")]
+        prepared(started);
         true
     }
 
@@ -473,7 +486,14 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
+            #[cfg(feature = "diagnostics")]
+            let making = std::time::Instant::now();
             let made = self.tables(list, &t.used, compute);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::DrawTablesUs,
+                making.elapsed().as_micros() as u64,
+            );
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -810,6 +830,8 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TableHits, 1);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -819,6 +841,8 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TableMisses, 1);
             let Some(first) = host.dynamic(n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
@@ -835,33 +859,62 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view);
-                        }
-                    }
-                    None => {
-                        host.make_null_for_used(index, used.copied());
-                        if used.is_some() {
-                            once!(slot, "a table entry without a view");
-                        }
-                    }
-                }
+                let used = entries
+                    .iter()
+                    .find(|u| u.table_offset_dwords / 8 == k)
+                    .copied();
+                self.make_table_entry(
+                    list,
+                    host,
+                    index,
+                    k,
+                    crate::descriptor::view(table + u64::from(k) * 32),
+                    used,
+                    slot,
+                );
             }
             made.push((slot, first * 32));
         }
         made
+    }
+
+    /// Makes host slot `index` (entry `k` of the table at `table`) from the
+    /// title descriptor `view`.
+    fn make_table_entry(
+        &mut self,
+        list: &HostList,
+        host: &crate::descriptor::host::HostHeap,
+        index: u32,
+        k: u32,
+        view: Option<View>,
+        used: Option<&UsedResource>,
+        slot: u8,
+    ) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TableEntries, 1);
+        let _ = (k, slot);
+        match view {
+            Some(View::Constant(address, size)) => {
+                let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                    host.make_null(index);
+                    return;
+                };
+                list.defer_fill(to, address as *const u8, size as usize);
+                host.constant_at(index, gpu, size);
+            }
+            Some(view) => {
+                host.make_at(index, &view);
+                if let Some(u) = used {
+                    readable(list, u, &view);
+                }
+            }
+            None => {
+                host.make_null_for_used(index, used);
+                if used.is_some() {
+                    once!(slot, "a table entry without a view");
+                }
+            }
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -1038,11 +1091,21 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let calling = std::time::Instant::now();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(
+                    crate::copystat::C::DrawCallUs,
+                    calling.elapsed().as_micros() as u64,
+                );
+                crate::copystat::add(crate::copystat::C::Draws, 1);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {

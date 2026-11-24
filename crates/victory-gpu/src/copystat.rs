@@ -60,8 +60,19 @@ pub(crate) enum C {
     /// many calls.
     EntryUs,
     EntryCalls,
+    /// Of a title call: preparing it (bindings, vertex buffers, targets) and
+    /// the driver's draw call itself; of preparing, making its tables.
+    DrawPrepUs,
+    DrawTablesUs,
+    DrawCallUs,
+    Draws,
+    /// Table lookups that found the table already made, that had to make it,
+    /// and the descriptor slots made with it.
+    TableHits,
+    TableMisses,
+    TableEntries,
 }
-const COUNTERS: usize = 37;
+const COUNTERS: usize = 44;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -182,6 +193,20 @@ pub(crate) fn log(frames: f64) {
         "of the title's calls: {:.2} ms in {} draws, dispatches and copies",
         ms(c[C::EntryUs as usize]),
         c[C::EntryCalls as usize],
+    );
+    tracing::info!(
+        "of a draw: {:.1} ms preparing (of which {:.1} ms tables), {:.1} ms in the driver's call, \
+         {:.0} draws",
+        ms(c[C::DrawPrepUs as usize]),
+        ms(c[C::DrawTablesUs as usize]),
+        ms(c[C::DrawCallUs as usize]),
+        c[C::Draws as usize],
+    );
+    tracing::info!(
+        "tables: {:.0} hits, {:.0} misses, {:.0} descriptor slots made",
+        c[C::TableHits as usize],
+        c[C::TableMisses as usize],
+        c[C::TableEntries as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

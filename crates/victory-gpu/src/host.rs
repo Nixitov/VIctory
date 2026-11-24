@@ -1845,6 +1845,16 @@ impl Batch<'_> {
     }
 }
 
+/// Whether presenting returns before the frame's submissions finished
+/// (`VICTORY_PRESENT_ASYNC=1`): the title's own fences then decide when it
+/// waits, and the CPU can prepare the next frame while the GPU runs this
+/// one. Off by default: a title may take a present as the GPU being done
+/// with the frame's memory.
+fn present_async() -> bool {
+    static ASYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASYNC.get_or_init(|| matches!(std::env::var("VICTORY_PRESENT_ASYNC").as_deref(), Ok("1")))
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -2332,7 +2342,12 @@ impl Host {
             // title may take a present for the GPU being done with the
             // frame). Only work within a frame overlaps; let one frame run
             // on once titles are known to wait for their fences instead.
-            self.drain();
+            // `VICTORY_PRESENT_ASYNC=1` skips that wait: the title's fences
+            // then decide when it waits, and the CPU prepares the next frame
+            // while the GPU runs this one.
+            if !present_async() {
+                self.drain();
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
