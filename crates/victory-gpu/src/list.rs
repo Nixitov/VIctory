@@ -1060,13 +1060,15 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
-            s.draw(list, vertices, instances, first, first_instance)
+        super::timed(|| {
+            with_state(this, |list, s| {
+                s.draw(list, vertices, instances, first, first_instance)
+            })
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        super::timed(|| with_state(this, |list, s| s.dispatch(list, x, y, z)));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1076,7 +1078,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::timed(|| with_state(this, |list, s| s.dispatch_mesh(list, x)));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1094,7 +1096,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::timed(|| with_state(this, |list, s| s.dispatch_mesh(list, x)));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1105,9 +1107,26 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
-            s.draw_indexed(list, indices, instances, first, base, first_instance)
+        super::timed(|| {
+            with_state(this, |list, s| {
+                s.draw_indexed(list, indices, instances, first, base, first_instance)
+            })
         });
+    }
+}
+
+/// Runs `f`, counting its time among the title's calls (diagnostics).
+fn timed(f: impl FnOnce()) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    f();
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(
+            crate::copystat::C::EntryUs,
+            started.elapsed().as_micros() as u64,
+        );
+        crate::copystat::add(crate::copystat::C::EntryCalls, 1);
     }
 }
 

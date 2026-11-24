@@ -135,6 +135,7 @@ fn build(setup: &[(u8, u32)], sample: [u32; 2]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_waves: None,
     })
     .expect("lower");
     let shader = HostShader {

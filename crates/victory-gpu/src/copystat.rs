@@ -56,8 +56,12 @@ pub(crate) enum C {
     /// Writes attempted and failed: a failed one halves its range.
     WriteCalls,
     WriteFails,
+    /// Time in the title's draw, dispatch and copy entry points, and how
+    /// many calls.
+    EntryUs,
+    EntryCalls,
 }
-const COUNTERS: usize = 35;
+const COUNTERS: usize = 37;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -173,6 +177,11 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackGuard as usize]),
         c[C::WriteCalls as usize],
         c[C::WriteFails as usize],
+    );
+    tracing::info!(
+        "of the title's calls: {:.2} ms in {} draws, dispatches and copies",
+        ms(c[C::EntryUs as usize]),
+        c[C::EntryCalls as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
